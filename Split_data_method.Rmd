@@ -1,0 +1,111 @@
+---
+title: "141XP Proj"
+author: "Isaiah C. Mireles"
+date: "2026-05-08"
+output: html_document
+---
+
+```{r}
+setwd("/Users/isaiahmireles/Desktop/Material related to Dr. Ghahremani and Lavretsky")
+```
+
+```{r}
+library(readxl)
+df_dict <- read_excel("Stats141XP_AABC_study_data_dictionary.xlsx")
+```
+
+```{r}
+df <- read.csv("Stats141XP_AABC_Release2_data.csv", header = FALSE)
+
+# make first row the column names
+colnames(df) <- as.character(unlist(df[2, ]))
+
+df <- df[-(1:2), ]
+```
+
+```{r}
+library(dplyr)
+outcomes <- 
+  df |> 
+  select(id_event, Memory_Tr35_60y, FluidIQ_Tr35_60y, CrystIQ_Tr35_60y) |>
+  mutate(across(-id_event, as.numeric)) 
+```
+
+# Outcome var are normally distributed :
+
+```{r}
+hist(outcomes$Memory_Tr35_60y)
+```
+
+```{r}
+hist(outcomes$FluidIQ_Tr35_60y)
+```
+
+```{r}
+hist(outcomes$CrystIQ_Tr35_60y)
+```
+
+```{r}
+df %>%
+  group_by(id) %>%
+  mutate(age_open_num = as.numeric(age_open),
+         years_since_baseline = age_open_num - min(age_open_num, na.rm=TRUE))
+```
+
+```{r}
+unique(df_dict$data_category)
+```
+
+# Splitting the data 
+
+glance
+
+```{r}
+df_dict |> group_by(data_category) |> select(data_category, "variable name - description") |> filter(data_category=="Blood markers")
+
+df_dict |> group_by(data_category) |> select(data_category, "variable name - description") |> filter(data_category=="Diet")
+```
+
+do:
+
+```{r}
+diet_col_names <- 
+  df_dict |>
+  group_by(data_category) |>
+  select(data_category, `variable name - description`) |>
+  filter(data_category == "Diet") |>
+  mutate(
+    col_names = gsub(" -.*", "", `variable name - description`)
+  )
+
+blood_col_names <- 
+  df_dict |>
+  group_by(data_category) |>
+  select(data_category, `variable name - description`) |>
+  filter(data_category == "Blood markers") |>
+  mutate(
+    col_names = gsub(" -.*", "", `variable name - description`)
+  )
+```
+
+```{r}
+blood_data <- df |> select(id_event, id, event, study, blood_col_names$col_names) |>
+  mutate(
+    across(
+      -c(id_event, id, event, study),
+      as.numeric
+    )
+  ) 
+diet_data <- df |> select(id_event, id, event, study, diet_col_names$col_names) |>
+  mutate(
+    across(
+      -c(id_event, id, event, study),
+      as.numeric
+    )
+  )
+```
+
+```{r}
+write.csv(blood_data, "blood_data_update.csv")
+write.csv(diet_data, "diet_data_update.csv")
+```
