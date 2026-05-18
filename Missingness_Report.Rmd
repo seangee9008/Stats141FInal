@@ -1,0 +1,541 @@
+---
+title: "Missingness Report"
+author: "Isaiah C. Mireles"
+date: "2026-05-17"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+# Read Data
+
+```{r rd, include = F}
+library(readr)
+library(dplyr)
+library(stringr)
+
+blood <- 
+  read_csv("~/Desktop/Material related to Dr. Ghahremani and Lavretsky/blood_data.csv")
+
+diet <- 
+  read_csv("~/Desktop/Material related to Dr. Ghahremani and Lavretsky/diet_data_update.csv")
+
+blood <- blood[,-1]
+diet <- diet[,-1]
+
+relevant_dict <-
+  read_csv("~/Desktop/Material related to Dr. Ghahremani and Lavretsky/relevant_dict.csv")
+all <- read_csv("~/Desktop/Material related to Dr. Ghahremani and Lavretsky/Stats141XP_AABC_Release2_data.csv")
+
+cl_nm <- all[1,]
+all <- all[-1,]
+colnames(all) <- cl_nm
+
+library(readxl)
+all_dict <- read_excel(
+  "~/Desktop/Material related to Dr. Ghahremani and Lavretsky/Stats141XP_AABC_study_data_dictionary.xlsx"
+)
+```
+
+# Order of Events
+
+## event, study pairs
+
+```{r}
+all |> dplyr::distinct(event, study)
+```
+
+-   notice some peoples first visit ( `V1` ) may be in `HCA` or, `AABC` – same being true for `V2`
+
+    -   suggesting people joined study at different time periods
+
+```{r}
+all <- all |>
+  dplyr::mutate(
+    event = factor(
+      event,
+      levels = c(
+        "V1", "F1",
+        "V2", "F2",
+        "CR",
+        "V3", "F3",
+        "V4",
+        "AF1"
+      ),
+      ordered = TRUE
+    ),
+
+    study = factor(
+      study,
+      levels = c("HCA", "AABC"),
+      ordered = TRUE
+    )
+  )
+```
+
+```{r}
+patient_paths <-
+  all |>
+  filter(age_open != "90 or older") |>
+  mutate(age_open = as.numeric(age_open)) |> 
+  mutate(
+    patient = str_remove(id, "^[A-Z]+")
+  ) |>
+  distinct(patient, study, event, age_open) |>
+  arrange(patient, study, event) |>
+  group_by(patient) |>
+  arrange(study, event) |> 
+  summarise(
+    n_total = n(),
+    n_studies = n_distinct(study),
+    n_events = n_distinct(event),
+
+    years_passed = if_else(
+      n() > 1,
+      max(age_open, na.rm = TRUE) - min(age_open, na.rm = TRUE),
+      NA_real_
+    ),
+
+    study_event_path = paste(
+      paste(study, event, sep = ":"),
+      collapse = " → "
+    ),
+
+    .groups = "drop"
+  ) |>
+  select(patient, years_passed, study_event_path, years_passed, everything()) |>
+  arrange(desc(years_passed))
+patient_paths
+```
+
+```{r}
+plot(patient_paths$years_passed, patient_paths$n_events, xlab = "Yrs Passed", ylab = "n_events")
+```
+
+# Missingness Relevance
+
+A great deal of data is missing ( `NA` ) – therefore our data is heavily **biased**. We would like to determine in *what way* its **biased.** Perhaps by adjusting for this bias we see strong associations for each variable to the cognitive markers in studying dimentia.
+
+## Blood Data
+
+```{r b_ms, message = F, warning=FALSE}
+library(dplyr)
+library(naniar)
+blood |> 
+  miss_var_summary() |>
+  as.data.frame() |>
+  select(variable, pct_miss) |> 
+  head(6)
+```
+
+-   direct_ldl is entirely missing, we may discard this feature
+
+-   Many repeated values
+
+## Diet Data
+
+```{r}
+diet |> 
+  miss_var_summary() |>
+  as.data.frame() |>
+  select(variable, pct_miss) |> 
+  head(6)
+```
+
+[interpretation]{.underline} :
+
+-   Notice the only features without missingness
+
+-   Notice the large amount of missingness is the
+
+    |                               |
+    |:------------------------------|
+    | Participant info/Demographics |
+
+    -   **`data_category`**
+
+-   Notice that the missingness appears to repeat – showing *runs* of the same `pct_miss` for both features
+
+## Ct and Graph Repeated Missingness
+
+## Diet Data
+
+```{r}
+ct <-
+  diet |> 
+  miss_var_summary() |> 
+  mutate(
+    ct = ifelse(pct_miss == 0, 0, 1)
+    ) |> count(ct) 
+ct
+```
+
+[Interpretation]{.underline} :
+
+-   There are only 4 non-missing values every other value is just `84.6` percent missing – which is a **HUGE** amt.
+
+## Blood Data
+
+```{r}
+ct <- 
+  blood |> 
+  miss_var_summary() 
+
+library(ggplot2)
+ct |> 
+  ggplot(aes(pct_miss)) + 
+  geom_histogram(binwidth = 10) 
+```
+
+[interpretation]{.underline}
+
+-   this one is slightly more varied
+
+-   0, about 60, 90 100% percent missing – with 60, 90 happening quite frequently
+
+```{r}
+ct <- ct |>
+  mutate(
+    char = format(pct_miss)
+  )
+
+ct <- as.vector(ct$pct_miss)/100
+ct <- ct |> round(1) 
+ct <- ct |> as.character()
+barplot(table(ct))
+```
+
+-   We can see that the repeated values are near 0 (id features), 60%, 90% or 100%
+
+# Build Features
+
+## `patient` s**tudy** & events ct
+
+[Purpose]{.underline} : identify how often a `patients` appear in our data.
+
+For example :
+
+-   Are they in both studies?
+
+-   How many unique events?
+
+### Helper Func : Create `unique_id`, `Patient` Variable
+
+```{r}
+library(dplyr)
+
+diet <-
+  diet |>
+  mutate(
+    patient = str_remove(id, "^[A-Z]+") 
+  ) |> select(patient, everything())
+
+blood <-
+  blood |>
+  mutate(
+    patient = str_remove(id, "^[A-Z]+") 
+  ) |> select(patient, everything())
+```
+
+# `patient` s**pecific missing ct**
+
+[Purpose]{.underline} : identify how often `patients` appear in our data to better understand missing values.
+
+## Diet
+
+```{r}
+diet_patients <-
+  diet |>
+  group_by(patient) |>
+  summarize(
+    n_rows = n(),
+    total_missing =
+      sum(across(everything(), ~ sum(is.na(.x)))),
+    .groups = "drop"
+  ) |>
+  mutate(
+    pct =
+      round(
+        total_missing /
+          (n_rows * (ncol(diet) - 1)),
+        2
+      )
+  ) |>
+  arrange(desc(pct))
+
+diet_patients <-
+  diet_patients |>  mutate(
+    p_rank = paste0("patient", row_number())
+  ) |> select(p_rank, everything(), patient)
+```
+
+```{r}
+plot(diet_patients$n_rows, diet_patients$total_missing)
+```
+
+## blood
+
+```{r}
+blood_patients <-
+  blood |>
+  group_by(patient) |>
+  summarize(
+    n_rows = n(),
+    total_missing =
+      sum(across(everything(), ~ sum(is.na(.x)))),
+    total_cells =
+      n_rows * ncol(pick(everything())),
+    pct =
+      round(total_missing / total_cells, 2),
+    .groups = "drop"
+  ) |>
+  arrange(desc(pct))
+
+blood_patients <-
+  blood_patients |>  mutate(
+    p_rank = paste0("patient", row_number())
+  ) |> select(p_rank, everything(), patient)
+```
+
+```{r}
+plot(blood_patients$n_rows,blood_patients$total_missing)
+```
+
+# Correlations of `Cognitive` Features – ALL
+
+Note :
+
+-   we have repeated observations, so we are taking people who had more visits more into account
+
+```{r str_splt, include = F}
+#grep("dict", ls(), value=T)
+all_dict |> 
+  filter(data_category=="Cognitive") |> 
+  select("variable name - description") 
+```
+
+-   Relevant factor analysis Features\^
+
+    -   `Memory_Tr35_60y`,
+
+        -   Cognition Factor Analysis: Memory factor estimated in Union V1 35-60 yo subjects and applied to all subjects all visits
+
+    -   `FluidIQ_Tr35_60y`,
+
+        -   Cognition Factor Analysis: Fluid IQ factor estimated in Union V1 35-60 yo subjects and applied to all subjects all visits
+
+    -   `CrystIQ_Tr35_60y`
+
+        -   Cognition Factor Analysis: Crystallized IQ factor estimated in Union V1 35-60 yo subjects and applied to all subjects all visits
+
+```{r}
+Memory <- all$Memory_Tr35_60y |> as.numeric()
+fluidIQ <- all$FluidIQ_Tr35_60y |> as.numeric()
+CrystIQ <- all$CrystIQ_Tr35_60y |> as.numeric()
+```
+
+## `Memory`, `fluidIQ` dot-plt
+
+```{r}
+# Memory ~ fluidIQ
+Memory_fluidIQ_mdl <- lm(Memory ~ fluidIQ)
+
+plot(Memory, fluidIQ)
+abline(Memory_fluidIQ_mdl, col = "red")
+```
+
+## `Memory`, `CrystIQ` dot-plt
+
+```{r}
+# Memory ~ CrystIQ
+Memory_CrystIQ_mdl <- lm(Memory ~ CrystIQ)
+
+plot(Memory, CrystIQ)
+abline(Memory_CrystIQ_mdl, col = "red")
+```
+
+## `fluidIQ`, `CrystIQ` dot-plt
+
+```{r}
+# fluidIQ ~ CrystIQ
+fluidIQ_CrystIQ_mdl <- lm(fluidIQ ~ CrystIQ)
+
+plot(fluidIQ, CrystIQ)
+abline(fluidIQ_CrystIQ_mdl, col = "red")
+```
+
+```{r}
+diet_num <- diet |> select(where(is.numeric))
+blood_num <- blood |> select(where(is.numeric))
+```
+
+```{r}
+diet_num <- cbind(Memory, fluidIQ, CrystIQ, diet_num)
+blood_num <- cbind(Memory, fluidIQ, CrystIQ, blood_num)
+```
+
+# Diet Correlations w/ `Memory`
+
+```{r}
+mem_cor <-
+  cor(diet_num$Memory, diet_num[4:length(diet_num)],
+      use = "complete.obs")
+
+
+mem_cor <-
+  mem_cor |> 
+  t() |> as.data.frame()
+```
+
+```{r}
+mem_cor <- 
+  mem_cor |> 
+  rename(Memory = V1) |> 
+  round(3) |>
+  select(Memory)
+
+mem_cor |> head(5)
+```
+
+# Diet Correlations w/ `fluidIQ`
+
+```{r}
+fluid_cor <-
+  cor(diet_num$fluidIQ, diet_num[4:length(diet_num)],
+      use = "complete.obs")
+
+
+fluid_cor <-
+  fluid_cor |> 
+  t() |> as.data.frame()
+
+fluid_cor |> 
+  rename(fluidIQ = V1) |> 
+  round(3) |>
+  select(fluidIQ) |> head(5)
+```
+
+# Diet Correlations w/ `CrystIQ`
+
+```{r}
+cryst_cor <-
+  cor(diet_num$CrystIQ, diet_num[4:length(diet_num)],
+      use = "complete.obs")
+
+
+cryst_cor <-
+  cryst_cor |> 
+  t() |> as.data.frame()
+
+cryst_cor <-
+  cryst_cor |> 
+  rename(CrystIQ = V1) |> 
+  round(3) |> select(CrystIQ) 
+
+
+cryst_cor |> head(5)
+```
+
+[Overall interpretation]{.underline}
+
+-   Extremely weak correlations for all variables in Diet Data
+
+    -   Diet Data doesnt appear strongly related
+
+[Possible Causes]{.underline}
+
+-   underlying relationship isnt linear
+
+-   Missing values may be biasing variables
+
+```{r}
+diet_cor_lst <-
+  list(
+  cryst_cor=cryst_cor,
+  fluid_cor=fluid_cor,
+  mem_cor=mem_cor
+)
+```
+
+# Patient level analysis
+
+```{r}
+blood |>
+  group_by(patient) |> 
+  select(patient, where(is.numeric)) |> 
+  summarize(
+    across(everything(), ~ mean(.x, na.rm = TRUE))
+  )
+```
+
+# Patient Correlations of `Cognitive` Features
+
+-   here we generate a report of correlations for each individual patient
+
+-   Suppose we just average out their values across all `Study` and `event`
+
+```{r}
+diet_patients
+```
+
+# Multivariate Normal – Cognitive Features
+
+```{r}
+cognitive_df <- 
+  all |> 
+  select(id_event, id, event, study,
+         Memory_Tr35_60y, 
+         FluidIQ_Tr35_60y, 
+         CrystIQ_Tr35_60y) |>
+  mutate(
+    patient = str_remove(id, "^[A-Z]+") 
+  ) |> select(patient, everything()) |>
+  mutate(
+    across(
+      -c(patient, id_event, id, event, study),
+      as.numeric
+    )
+  )
+```
+
+```{r}
+par(mfrow = c(1, 3))
+
+hist(
+  cognitive_df$Memory_Tr35_60y,
+  main = "Memory",
+  xlab = ""
+)
+
+hist(
+  cognitive_df$FluidIQ_Tr35_60y,
+  main = "FluidIQ",
+  xlab = ""
+)
+
+hist(
+  cognitive_df$CrystIQ_Tr35_60y,
+  main = "CrystIQ",
+  xlab = ""
+)
+```
+
+-   notice each is normally distributed
+
+```{r}
+
+cognitive_df |>
+  select(where(is.numeric)) |>
+  summarize(
+    mean_Memory = mean(Memory_Tr35_60y, na.rm = TRUE), 
+    sd_Memory = sd(Memory_Tr35_60y, na.rm = TRUE), 
+    mean_FluidIQ_y = mean(FluidIQ_Tr35_60y, na.rm = TRUE),
+    sd_FluidIQ = sd(FluidIQ_Tr35_60y, na.rm = TRUE), 
+    mean_CrystIQ = mean(CrystIQ_Tr35_60y, na.rm = TRUE),
+    sd_CrystIQ = sd(CrystIQ_Tr35_60y, na.rm = TRUE)
+  )
+```
