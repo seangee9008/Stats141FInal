@@ -1,0 +1,303 @@
+---
+title: "141XP Proj"
+author: "Sean Gee"
+date: "2026-05-08"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readr)
+library(tidyverse)
+library(dplyr)
+library(skimr)
+library(readxl)
+library(corrplot)
+library(broom)
+```
+
+```{r load-data, warning=FALSE}
+setwd("~/Desktop/141")
+df_dict <- read_excel("Stats141XP_AABC_study_data_dictionary.xlsx")
+df <- read.csv("Stats141XP_AABC_Release2_data.csv", header = FALSE)
+colnames(df) <- as.character(unlist(df[2, ]))
+df <- df[-(1:2), ]
+```
+
+
+```{r get-cols-function}
+get_cols <- function(category) {
+  df_dict |>
+    filter(data_category == category) |>
+    select(`variable name - description`) |>
+    mutate(col_names = gsub(" -.*", "", `variable name - description`)) |>
+    pull(col_names)
+}
+
+diet_cols  <- get_cols("Diet")
+blood_cols <- get_cols("Blood markers")
+sleep_cols <- get_cols("Sleep quality (self-report)")
+pa_cols    <- get_cols("Physical Activity (self-report)")
+cog_cols   <- get_cols("Cognitive")
+demo_cols  <- get_cols("Participant info/Demographics")
+```
+
+
+```{r build-dataframes, warning=FALSE}
+id_cols <- c("id_event", "id", "event", "study")
+
+blood_data <- df |>
+  select(all_of(id_cols), any_of(blood_cols)) |>
+  mutate(across(-all_of(id_cols), as.numeric))
+
+diet_data <- df |>
+  select(all_of(id_cols), any_of(diet_cols)) |>
+  mutate(across(-all_of(id_cols), as.numeric))
+
+sleep_data <- df |>
+  select(all_of(id_cols), any_of(sleep_cols)) |>
+  mutate(across(-all_of(id_cols), as.numeric))
+
+pa_data <- df |>
+  select(all_of(id_cols), any_of(pa_cols)) |>
+  mutate(across(-all_of(id_cols), as.numeric))
+
+cog_data <- df |>
+  select(all_of(id_cols), any_of(cog_cols)) |>
+  mutate(across(-all_of(id_cols), as.numeric))
+```
+
+```{r clean-age, warning=FALSE}
+df <- df |>
+  mutate(age_numeric = case_when(
+    age_open == "90 or older" ~ 90,
+    grepl("^[0-9]+$", age_open) ~ as.numeric(age_open),
+    TRUE ~ NA_real_
+  ))
+```
+
+# EDA
+
+```{r cog-histograms}
+hist(cog_data$Memory_Tr35_60y,
+     main = "Memory Score Distribution",
+     xlab = "Memory Factor Score", col = "steelblue")
+
+hist(cog_data$FluidIQ_Tr35_60y,
+     main = "Fluid IQ Distribution",
+     xlab = "Fluid IQ Factor Score", col = "steelblue")
+
+hist(cog_data$CrystIQ_Tr35_60y,
+     main = "Crystallized IQ Distribution",
+     xlab = "Crystallized IQ Factor Score", col = "steelblue")
+```
+All three cognitive outcomes are approximately normally distributed and centered near 0 this makes sense because they are factor scores, which are standardized by construction. This confirms we can use linear models without needing to transform the outcome variables.
+
+```{r age-distribution}
+ggplot(df, aes(x = age_numeric)) +
+  geom_histogram(bins = 20, fill = "steelblue", color = "white") +
+  labs(title = "Age Distribution", x = "Age", y = "Count") +
+  theme_minimal()
+```
+The age distribution spans roughly 35–90, which matches the study design (HCA/AABC recruited adults aged 35+). The spread is relatively even, meaning our models won't be dominated by one age group.
+
+```{r blood-distributions}
+blood_data |>
+  select(glucose, cholesterol, hdl, friedewald_ldl, hba1c) |>
+  pivot_longer(everything()) |>
+  filter(!is.na(value)) |>
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~name, scales = "free") +
+  labs(title = "Blood Marker Distributions") +
+  theme_minimal()
+```
+Most blood markers are roughly bell-shaped. Glucose and hba1c show right skew with some high outliers, which likely represent diabetic participants. HbA1c and glucose correlate strongly (r=0.76 from our matrix below),confirming they measure the same underlying construct — blood sugar control.
+
+#Diet vs Blood Markers
+
+```{r diet-blood-merge}
+diet_blood <- inner_join(
+  diet_data  |> select(id, event, asa24_kcal, asa24_carb, asa24_sfat, asa24_sugr),
+  blood_data |> select(id, event, glucose, cholesterol, hdl, hba1c),
+  by = c("id", "event")
+)
+```
+We merge diet and blood data by both patient ID and visit (event), so we are comparing diet recorded at the same visit as the blood draw. inner_join keeps only rows where BOTH diet and blood data exist.
+
+```{r calories-glucose-plot}
+ggplot(diet_blood, aes(x = asa24_kcal, y = glucose)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm") +
+  labs(title = "Calories vs Glucose",
+       x = "Calories (kcal)", y = "Glucose (mg/dL)") +
+  theme_minimal()
+```
+The scatterplot shows no meaningful linear trend between caloric intake andblood glucose. The regression line is nearly flat, consistent with the near-zero correlation (r=0.01) we see in the matrix below. This suggests a single day's diet recall does not predict fasting glucose levels.
+
+```{r correlation-matrix}
+cor(diet_blood |> select(-id, -event), use = "complete.obs") |> round(2)
+```
+Key findings from the correlation matrix:
+Diet macros are highly correlated with each other (kcal-carb: 0.87, kcal-sfat: 0.82) — expected since they all scale with how much food eaten. Diet variables show near-zero correlations with blood markers (all < |0.15|). The strongest signal: glucose-hba1c (r=0.76), which makes clinical sense since HbA1c reflects average blood sugar over 3 months. HDL is negatively correlated with all diet fat measures — higher fat intake associates with lower "good" cholesterol.
+
+# Patient-Averaged Analysis (fixing Isaiah's repeated obs problem)
+
+```{r patient-average}
+
+patient_avg <- inner_join(
+  diet_data  |> select(id, any_of(diet_cols)),
+  blood_data |> select(id, any_of(blood_cols)),
+  by = "id"
+) |>
+  inner_join(cog_data |> select(id, Memory_Tr35_60y,
+                                 FluidIQ_Tr35_60y, CrystIQ_Tr35_60y),
+             by = "id") |>
+  group_by(id) |>
+  summarise(across(where(is.numeric), ~ mean(., na.rm = TRUE))) |>
+  ungroup()
+```
+ By collapsing to one row per patient (their mean across all visits), we remove the statistical inflation Isaiah identified — patients with more visits were previously counted more times, biasing correlations.
+
+```{r patient-avg-correlations}
+# Focus on Isaiah's top diet predictors vs all three cognitive outcomes
+key_vars <- patient_avg |>
+  select(Memory_Tr35_60y, FluidIQ_Tr35_60y, CrystIQ_Tr35_60y,
+         asa24_fibe, asa24_magn, asa24_ff, asa24_fola,
+         glucose, hba1c, hdl, cholesterol) |>
+  drop_na()
+
+cor_matrix <- cor(key_vars, use = "complete.obs")
+
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.cex = 0.7, addCoef.col = "black", number.cex = 0.6,
+         title = "Diet + Blood vs Cognition (Patient Averages)",
+         mar = c(0,0,1,0))
+```
+This correlation plot uses patient-level averages, correcting for the repeated observations issue. We focus on the diet variables Isaiah found most predictive (fiber, magnesium, food folate) plus key blood markers. Numbers inside each cell show the actual correlation coefficient.
+
+# Linear Models
+
+```{r model-memory-diet}
+model_diet <- lm(Memory_Tr35_60y ~ asa24_fibe + asa24_magn + asa24_fola + asa24_kcal,
+                 data = patient_avg)
+summary(model_diet)
+tidy(model_diet) |> mutate(across(where(is.numeric), ~ round(., 3)))
+```
+Linear regression of Memory on Isaiah's top diet predictors.
+
+```{r model-memory-blood}
+model_blood <- lm(Memory_Tr35_60y ~ glucose + hba1c + hdl + cholesterol,
+                  data = patient_avg)
+summary(model_blood)
+tidy(model_blood) |> mutate(across(where(is.numeric), ~ round(., 3)))
+```
+ Same structure but using blood markers as predictors. We expect hba1c (long-term blood sugar) to be more predictive than single-visit glucose, since it reflects chronic metabolic health.
+
+```{r model-memory-combined}
+model_combined <- lm(Memory_Tr35_60y ~ asa24_fibe + asa24_magn +
+                       asa24_fola + glucose + hba1c + hdl,
+                     data = patient_avg)
+summary(model_combined)
+tidy(model_combined) |> mutate(across(where(is.numeric), ~ round(., 3)))
+
+# Compare all three models — lower AIC = better fit
+AIC(model_diet, model_blood, model_combined)
+```
+We compare diet-only, blood-only, and combined models using AIC
+
+# Longitudinal Change Analysis
+
+```{r longitudinal-change}
+# Keep only standard in-person visits (V1-V4), exclude COVID/followup visits
+longitudinal <- inner_join(
+  diet_data  |> select(id, event, asa24_fibe, asa24_kcal),
+  blood_data |> select(id, event, glucose, hba1c),
+  by = c("id", "event")
+) |>
+  inner_join(cog_data |> select(id, event, Memory_Tr35_60y, FluidIQ_Tr35_60y),
+             by = c("id", "event")) |>
+  filter(event %in% c("V1", "V2", "V3", "V4")) |>
+  group_by(id) |>
+  filter(n() >= 2) |>   # only patients with at least 2 visits
+  arrange(id, event)
+```
+Isaiah's report noted the data is longitudinal (multiple visits per person). Here we isolate patients who attended at least 2 in-person visits so we can measure change over time. We exclude COVID remote surveys (CR) and follow-up-only visits since those weren't collected the same way.
+
+```{r compute-change}
+change_df <- longitudinal |>
+  group_by(id) |>
+  summarise(
+    delta_glucose  = last(glucose)         - first(glucose),
+    delta_hba1c    = last(hba1c)           - first(hba1c),
+    delta_fiber    = last(asa24_fibe)      - first(asa24_fibe),
+    delta_memory   = last(Memory_Tr35_60y) - first(Memory_Tr35_60y),
+    delta_fluidIQ  = last(FluidIQ_Tr35_60y) - first(FluidIQ_Tr35_60y),
+    n_visits       = n()
+  ) |>
+  drop_na()
+```
+A positive delta_memory means their memory improved over time.
+A positive delta_glucose means their blood sugar got worse over time.
+
+
+
+
+
+
+
+```{r}
+# Check how many rows you actually have at each step
+nrow(longitudinal)   # how many rows after the join?
+nrow(change_df)      # how many patients survived drop_na()?
+
+# The fix: don't require diet AND blood to both be present
+# Instead, compute change scores separately and join after
+
+# Change in blood markers (these have much less missingness)
+blood_change <- blood_data |>
+  filter(event %in% c("V1", "V2", "V3", "V4")) |>
+  group_by(id) |>
+  filter(n() >= 2) |>
+  arrange(id, event) |>
+  summarise(
+    delta_glucose = last(glucose)  - first(glucose),
+    delta_hba1c   = last(hba1c)    - first(hba1c)
+  )
+
+# Change in cognition
+cog_change <- cog_data |>
+  filter(event %in% c("V1", "V2", "V3", "V4")) |>
+  group_by(id) |>
+  filter(n() >= 2) |>
+  arrange(id, event) |>
+  summarise(
+    delta_memory  = last(Memory_Tr35_60y)   - first(Memory_Tr35_60y),
+    delta_fluidIQ = last(FluidIQ_Tr35_60y)  - first(FluidIQ_Tr35_60y)
+  )
+
+# Join blood + cog change (don't include diet since it's too sparse)
+change_df <- inner_join(blood_change, cog_change, by = "id") |>
+  drop_na()
+
+nrow(change_df)  # should be much bigger now
+```
+
+```{r}
+# Plot with enough data now
+ggplot(change_df, aes(x = delta_glucose, y = delta_memory)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", color = "tomato") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Change in Glucose vs Change in Memory",
+       x = "Δ Glucose (mg/dL)", y = "Δ Memory Score") +
+  theme_minimal()
+
+# Model with enough observations
+model_change <- lm(delta_memory ~ delta_glucose + delta_hba1c, data = change_df)
+summary(model_change)
+```
+The longitudinal model explains essentially none of the variance in memory change, suggesting that blood sugar fluctuations between visits are not a meaningful driver of cognitive change in this sample. Taken together, our analyses suggest that within the range of metabolic health represented in this dataset, short-term changes in blood glucose markers do not track with cognitive trajectory.
+
